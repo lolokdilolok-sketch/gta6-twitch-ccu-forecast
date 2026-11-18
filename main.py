@@ -12,7 +12,7 @@ Method (fitted and verified in the build session, 2026-11-18):
     locally-weighted log regression fitted at run time on the case's own
     comparables (41 past big launches): for each hour h, log viewers_h
     is regressed on log hour-1 viewers with Gaussian kernel weights
-    (bandwidth 1.5 in log space), spread = robust (MAD) residual SD,
+    (bandwidth 1.6 in log space), spread = robust (MAD) residual SD,
     clipped to [0.10, 0.30]. The cap, bandwidth and training set were
     tuned by proper leave-one-out over the four practice answers
     (held-out curve never in training): cap 0.45 scores 0.164, cap
@@ -28,17 +28,33 @@ Method (fitted and verified in the build session, 2026-11-18):
     practice hour-1 (269,517) and the smallest large-launch comparable
     (319,909); any threshold in that gap gives identical results.
     With the conditional filter, proper LOO is 0.132 (per case 0.100 /
-    0.146 / 0.106 / 0.175), confirmed on two independent checks
-    (leave-one-out over the 28 clean comparables: median 0.360;
-    top-5 largest-p1 holdout: 0.151, vs 0.166 for the unconditional
-    filter and 0.140 with no filter at all). The band widens by +0.15
-    when hour 1 falls outside the training range, which is exactly
-    the record-breaking-launch case. Leave-one-out on the four
-    practice answers this scores a mean pinball loss of 0.132, vs
-    0.387 for the house persistence baseline - and unlike a flat
-    plateau it follows the real launch shape: a dip to ~0.7x at hours
-    3-4, a slow climb, and a peak of ~1.0-1.4x around hours 19-21 as
-    the US unlocks and prime time arrives, then a fall at hour 24.
+    0.146 / 0.107 / 0.175), confirmed on two independent checks
+    (leave-one-out over the 28 clean comparables: median 0.359;
+    top-5 largest-p1 holdout: 0.144, vs 0.151 for v4). The band
+    widens when hour 1 falls outside the training range, in
+    proportion to the log distance outside it (full +0.15 only once
+    hour 1 is e times the largest launch seen) — v4's flat +0.15
+    jumped discontinuously at the boundary, over-widening a launch
+    just above the training max.
+  * v6 (this version) adds two reference ideas that survived proper
+    LOO on all four validation sets (see BUILD_NOTES Step 8):
+    (1) a second kernel dimension on log viewers-per-channel at
+    hour 1 (bandwidth 1.0) — launches with a similar audience
+    concentration shape more like the target; (2) a 0.2 blend
+    toward a fit on console-only curves, only for console-only
+    targets (GTA VI launches on PS5 / Xbox Series X|S, no PC) —
+    console launches share the rolling-midnight unlock shape, and
+    all 7 console-only comparables improve under it in LOO.
+    Proper LOO: 0.131 (per case 0.108 / 0.141 / 0.095 / 0.180),
+    comp28 median 0.344, top-5 holdout 0.142, vs 0.132 / 0.359 /
+    0.144 for v5. Bias correction, LOO-stacked ensembles,
+    print-dependent spread, bounded scale-frontier caps and
+    sequel tilts were all tried and discarded (Step 8 table).
+    Leave-one-out on the four practice answers this scores a mean pinball loss of 0.131, vs 0.387 for
+    the house persistence baseline - and unlike a flat plateau it
+    follows the real launch shape: a dip to ~0.7x at hours 3-4, a
+    slow climb, and a peak of ~1.0-1.4x around hours 19-21 as the US
+    unlocks and prime time arrives, then a fall at hour 24.
   * If the run-time fit fails for any reason, a hardcoded OLS fallback
     (same regression, fitted offline on 41 launch curves) is used, so
     the case is still valid.
@@ -75,6 +91,14 @@ PRACTICE_CURVES = {
     "rdr2": [116550.0, 102778.0, 99986.0, 84459.0, 152428.0, 176319.0, 163532.0, 148485.0, 134888.0, 120686.0, 119921.0, 138073.0, 165093.0, 195646.0, 231529.0, 264043.0, 330969.0, 369358.0, 322991.0, 290598.0, 281596.0, 258394.0, 223948.0, 192584.0],
     "gow": [269517.0, 220787.0, 146900.0, 141669.0, 156301.0, 281917.0, 273454.0, 258613.0, 196345.0, 186781.0, 189204.0, 152840.0, 179704.0, 217655.0, 271761.0, 310384.0, 376075.0, 435038.0, 444580.0, 460387.0, 445097.0, 434600.0, 411192.0, 383725.0],
     "spiderman2": [119087.0, 79573.0, 51615.0, 50272.0, 166214.0, 146818.0, 125021.0, 109152.0, 93203.0, 83997.0, 71214.0, 43730.0, 68551.0, 100971.0, 131596.0, 164722.0, 176018.0, 225745.0, 250538.0, 240849.0, 258378.0, 263140.0, 253088.0, 216387.0],
+}
+
+# Hour-1 channels of the four practice games (their cases' `known`).
+PRACTICE_CH1 = {
+    "wolverine": 619,
+    "rdr2": 2435,
+    "gow": 2709,
+    "spiderman2": 1784,
 }
 
 # --- Fallback OLS: (a, b, spread) per hour h = 2..24 ------------------
@@ -196,23 +220,28 @@ def _robust_spread(residuals, cap=0.30):
     return 0.10 if s < 0.10 else (cap if s > cap else s)
 
 
-def _local_fit_quantiles(p1, curves, bw=1.5):
-    """Locally-weighted log regression (bandwidth 1.5) per hour.
+def _fit_meds_spreads(p1, curves, vpc_target, bw=1.6):
+    """Locally-weighted log regression (bandwidth 1.6) per hour, with a
+    second kernel dimension on log viewers-per-channel at hour 1
+    (bandwidth 1.0, v6): curves whose audience is concentrated like
+    the target's count more.
 
-    curves: list of (p1, [24 hourly viewers]). Returns 23 rows of 5
-    quantiles, hours 2..24."""
+    curves: list of dicts {p1, vals, console, ch1}. Returns
+    (meds[23], spreads[23]) for hours 2..24."""
     lp = math.log(p1)
-    rows = []
+    xs = [math.log(c["p1"]) for c in curves]
+    lv = [math.log(c["p1"] / c["ch1"]) if c.get("ch1") else None
+          for c in curves]
+    meds = []
+    spreads = []
     for h in range(1, 24):
-        xs = []
-        ys = []
+        ys = [math.log(c["vals"][h]) for c in curves]
         ws = []
-        for cp1, vals in curves:
-            x = math.log(cp1)
-            d = (x - lp) / bw
-            ws.append(math.exp(-0.5 * d * d))
-            xs.append(x)
-            ys.append(math.log(vals[h]))
+        for x, l in zip(xs, lv):
+            w = math.exp(-0.5 * ((x - lp) / bw) ** 2)
+            if vpc_target is not None and l is not None:
+                w *= math.exp(-0.5 * ((l - vpc_target) / 1.0) ** 2)
+            ws.append(w)
         sw = sum(ws)
         mx = sum(w * x for w, x in zip(ws, xs)) / sw
         my = sum(w * y for w, y in zip(ws, ys)) / sw
@@ -225,12 +254,39 @@ def _local_fit_quantiles(p1, curves, bw=1.5):
         resid = [y - (a + b * x) for x, y in zip(xs, ys)]
         s = _robust_spread(resid)
         if lp > max(xs) or lp < min(xs):
-            # Hour 1 outside every launch seen: widen the band.
-            s = min(0.65, s + 0.15)
-        med = math.exp(a + b * lp)
+            # Hour 1 outside every launch seen: widen the band in
+            # proportion to the log distance outside the range (full
+            # +0.15 only once hour 1 is e times the largest launch
+            # seen). A flat +0.15 jumped discontinuously at the
+            # boundary and over-widened a launch just above the max.
+            d = max(lp - max(xs), min(xs) - lp)
+            s = min(0.65, s + 0.15 * min(1.0, d))
+        meds.append(math.exp(a + b * lp))
+        spreads.append(s)
+    return meds, spreads
+
+
+def _local_fit_quantiles(p1, curves, vpc_target, target_console, bw=1.6):
+    """Medians + spreads per hour, with a 0.2 blend toward a fit on
+    console-only curves when the target is console-only (v6):
+    console launches share the rolling-midnight unlock shape."""
+    meds, spreads = _fit_meds_spreads(p1, curves, vpc_target, bw)
+    if target_console:
+        cons = [c for c in curves if c.get("console")]
+        if len(cons) >= 8:
+            # The console fit is the plain 1-D kernel (no
+            # viewers-per-channel dimension), exactly as measured in
+            # the harness (exp/loo6.py): the console subset is small
+            # (12 curves) and a second kernel dimension on it is
+            # unmeasured noise.
+            cm, _ = _fit_meds_spreads(p1, cons, None, bw)
+            meds = [math.exp(0.2 * math.log(c) + 0.8 * math.log(m))
+                    for c, m in zip(cm, meds)]
+    rows = []
+    for i, (med, s) in enumerate(zip(meds, spreads)):
         q = [round2(med * math.exp(z * s)) for z in LEVELS_Z]
         q = [1 if v < 1 else (1000000000 if v > 1000000000 else v) for v in q]
-        rows.append({"hour": h + 1, "q": q})
+        rows.append({"hour": i + 2, "q": q})
     return rows
 
 
@@ -238,6 +294,17 @@ def generic_output(data, p1):
     """Forecast an unknown case from its own comparables."""
     import json
     case = json.loads(data.decode("utf-8"))
+    # Hour-1 channels of the target itself (the case's `known` row):
+    # log viewers-per-channel is the second kernel dimension (v6).
+    ch1_target = None
+    try:
+        ch1_target = (case.get("known") or [{}])[0].get("channels") or None
+    except Exception:
+        ch1_target = None
+    vpc_target = math.log(p1 / ch1_target) if ch1_target else None
+    # GTA VI launches on PS5 / Xbox Series X|S only, no PC (RULES.txt):
+    # a console-only target, so the console-stage blend applies.
+    target_console = True
     curves = []
     seen = set()
     for comp in case.get("comparables") or []:
@@ -260,7 +327,7 @@ def generic_output(data, p1):
         by_from = {}
         for row in hourly:
             try:
-                by_from[row["from"]] = row["viewers"]
+                by_from[row["from"]] = row
             except Exception:
                 continue
         ds = comp.get("day_start") or ""
@@ -269,19 +336,31 @@ def generic_output(data, p1):
         vals = []
         ok = True
         for h in range(24):
-            key = "%sT%02d:00:00Z" % (ds[:10], h)
-            v = by_from.get(key)
+            row = by_from.get("%sT%02d:00:00Z" % (ds[:10], h))
+            if row is None:
+                ok = False
+                break
+            v = row.get("viewers")
             if v is None or v <= 0:
                 ok = False
                 break
             vals.append(v)
-        if ok:
-            curves.append((vals[0], vals))
-    for vals in PRACTICE_CURVES.values():
-        curves.append((vals[0], vals))
+        if not ok:
+            continue
+        ch1 = None
+        row0 = by_from.get("%sT00:00:00Z" % ds[:10])
+        if row0 is not None and row0.get("channels"):
+            ch1 = row0["channels"]
+        plat = comp.get("platforms") or ""
+        curves.append({"p1": vals[0], "vals": vals,
+                       "console": ("PC" not in plat and "Stadia" not in plat),
+                       "ch1": ch1})
+    for name, vals in PRACTICE_CURVES.items():
+        curves.append({"p1": vals[0], "vals": vals, "console": True,
+                       "ch1": PRACTICE_CH1.get(name)})
     if len(curves) < 5:
         raise ValueError("too few training curves")
-    rows = _local_fit_quantiles(p1, curves)
+    rows = _local_fit_quantiles(p1, curves, vpc_target, target_console)
     return _dump(rows)
 
 
